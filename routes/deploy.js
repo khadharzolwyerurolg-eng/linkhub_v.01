@@ -1,6 +1,117 @@
 const router = require("express").Router();
-const Deploy = require("../models/Deploy"); // Importa o modelo correto de Deploy
+const Deploy = require("../models/Deploy"); 
 const axios = require("axios");
+
+
+const userAgents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+];
+
+//:: Função auxiliar para gerar cabeçalhos simulados com User-Agent aleatório
+const getHeadersConfig = () => {
+    const randomAgent = userAgents[Math.floor(Math.random() * userAgents.length)];
+    return {
+        'User-Agent': randomAgent,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
+    };
+};
+
+// Helper: verifica se um link está alcançável com retries, logging e resposta consistente
+const checkLinkAvailable = async (url) => {
+    if (!url) return { available: false, reason: 'no_link' };
+    const maxAttempts = 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const headers = getHeadersConfig();
+        try {
+            const resp = await axios.get(url, {
+                timeout: 7000,
+                maxRedirects: 5,
+                headers: { ...headers, 'Range': 'bytes=0-1024' },
+                validateStatus: () => true // sempre resolve, lidamos com status abaixo
+            });
+
+            return { available: true, status: resp.status };
+        } catch (err) {
+            // Se o servidor respondeu com erro (4xx/5xx), consideramos alcançável
+            if (err.response) {
+                return { available: true, status: err.response.status };
+            }
+
+            // Falha de rede/timeout: tentar novamente antes de desistir
+            if (attempt < maxAttempts) {
+                await new Promise((r) => setTimeout(r, 500 * attempt));
+                continue;
+            }
+
+            console.error(`checkLinkAvailable: failed for ${url} —`, err.code || err.message);
+            return { available: false, reason: err.code || err.message };
+        }
+    }
+    return { available: false, reason: 'unknown' };
+};
+
+// 2. Procurar um Deploy por ID com Verificação Online e Simulação (GET)
+router.get("/:id", async (req, res) => {
+    try {
+        const deploy = await Deploy.findById(req.params.id, { __v: 0 }) 
+            .populate("userId", "username email -_id") 
+            .populate("categoryId", "name -_id");      
+
+        if (!deploy) {
+            return res.status(404).json({ message: "Deploy not found!" });
+        }
+
+        let linkStatus = "unavailable (no link provided)";
+
+                if (deploy.link) {
+            const check = await checkLinkAvailable(deploy.link);
+            linkStatus = check.available ? "disponivel" : "indisponivel";
+        }
+
+        const responseData = deploy.toObject();
+        responseData.status_online = linkStatus;
+
+        return res.status(200).json(responseData);
+    } catch (err) {
+        return res.status(500).json({ message: "Error fetching deploy.", error: err.message });
+    }
+});
+
+// 3. Listar TODOS os Deploys com Verificação Online e Simulação Dinâmica (GET)
+router.get("/", async (req, res) => {
+    try {
+        const deploys = await Deploy.find({}, { __v: 0 }) 
+            .populate("userId", "username -_id")      
+            .populate("categoryId", "name -_id");     
+
+        const deploysComStatus = await Promise.all(
+            deploys.map(async (deploy) => {
+                const deployObj = deploy.toObject();
+                let linkStatus = "unavailable (no link provided)";
+
+                if (deployObj.link) {
+                    const check = await checkLinkAvailable(deployObj.link);
+                    linkStatus = check.available ? "disponivel" : "indisponivel";
+                }
+
+                deployObj.status_online = linkStatus;
+                return deployObj;
+            })
+        );
+
+        return res.status(200).json(deploysComStatus);
+    } catch (err) {
+        return res.status(500).json({ message: "Error fetching deploys.", error: err.message });
+    }
+});
+
+
 
 // 1. Criar / Registar um Deploy (POST) com higienização de Link::
 router.post("/register", async (req, res) => {
@@ -49,102 +160,6 @@ router.post("/register", async (req, res) => {
 });
 
 
-// 2. Procurar um Deploy por ID com Verificação Online Reforçada (GET)::
-router.get("/:id", async (req, res) => {
-    try {
-        const deploy = await Deploy.findById(req.params.id, { __v: 0 }) 
-            .populate("userId", "username email -_id") 
-            .populate("categoryId", "name -_id");      
-
-        if (!deploy) {
-            return res.status(404).json({ message: "Deploy not found!" });
-        }
-
-        let linkStatus = "unavailable (no link provided)";
-
-        if (deploy.link) {
-            try {
-                // maxRedirects: 5 força o axios a seguir os redirecionamentos (ex: http -> https)
-                // validateStatus permite considerar códigos 2xx e 3xx como válidos
-                const response = await axios.head(deploy.link, { 
-                    timeout: 3000,
-                    maxRedirects: 5,
-                    validateStatus: (status) => status >= 200 && status < 400
-                });
-                
-                linkStatus = "disponivel";
-            } catch (error) {
-                try {
-                    // PLANO B: Alguns servidores rejeitam o método HEAD (erro 405). 
-                    // Se o HEAD falhar, tentamos um GET ligeiro trazendo apenas a primeira linha da página
-                    const fallback = await axios.get(deploy.link, { 
-                        timeout: 2000, 
-                        maxRedirects: 5,
-                        headers: { 'Range': 'bytes=0-10' }, // Não faz o download do site todo
-                        validateStatus: (status) => status >= 200 && status < 400
-                    });
-                    linkStatus = "disponivel";
-                } catch (fallbackError) {
-                    linkStatus = "indisponivel";
-                }
-            }
-        }
-
-        const responseData = deploy.toObject();
-        responseData.status_online = linkStatus;
-
-        return res.status(200).json(responseData);
-    } catch (err) {
-        return res.status(500).json({ message: "Error fetching deploy.", error: err.message });
-    }
-});
-
-// 3. Listar TODOS os Deploys com Verificação Online Reforçada (GET)
-router.get("/", async (req, res) => {
-    try {
-        const deploys = await Deploy.find({}, { __v: 0 }) 
-            .populate("userId", "username -_id")      
-            .populate("categoryId", "name -_id");     
-
-        const deploysComStatus = await Promise.all(
-            deploys.map(async (deploy) => {
-                const deployObj = deploy.toObject();
-                let linkStatus = "unavailable (no link provided)";
-
-                if (deployObj.link) {
-                    try {
-                        const response = await axios.head(deployObj.link, { 
-                            timeout: 2500,
-                            maxRedirects: 5,
-                            validateStatus: (status) => status >= 200 && status < 400
-                        });
-                        linkStatus = "disponivel";
-                    } catch (error) {
-                        try {
-                            // PLANO B Geral
-                            await axios.get(deployObj.link, { 
-                                timeout: 2000, 
-                                maxRedirects: 5,
-                                headers: { 'Range': 'bytes=0-10' },
-                                validateStatus: (status) => status >= 200 && status < 400
-                            });
-                            linkStatus = "disponivel";
-                        } catch (fallbackError) {
-                            linkStatus = "indisponivel";
-                        }
-                    }
-                }
-
-                deployObj.status_online = linkStatus;
-                return deployObj;
-            })
-        );
-
-        return res.status(200).json(deploysComStatus);
-    } catch (err) {
-        return res.status(500).json({ message: "Error fetching deploys.", error: err.message });
-    }
-});
 
 // 4. Atualizar um Deploy (PUT)
 router.put("/:id", async (req, res) => {
